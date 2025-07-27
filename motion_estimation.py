@@ -192,41 +192,37 @@ def train_inr_model(
         if epoch in [0, 500, 999]:
             print(f"[Epoch {epoch}] Sampled coords (first 3): {sampled_coords[:3].cpu().numpy()}")
 
-        # Reconstruction loss
+        # Single ODE integration for all losses
+        time_tensor = torch.from_numpy(temporal_coords).float().to(device)
+        full_trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_tensor)
+        
+        # Reconstruction loss - use single trajectory
         recon_losses = []
         for frame_idx in range(T-1):
-            t_start = temporal_coords[frame_idx]
-            t_end = temporal_coords[-1]
-            time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
-
-            trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
-            warped_points = trajectories[-1]
-
+            warped_points = full_trajectories[frame_idx]
             I_ti_original = sample_intensity(frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), sampled_coords)
             I_T_warped = sample_intensity(target_frame.unsqueeze(0).unsqueeze(0), warped_points)
-
             recon_losses.append(torch.sum((I_ti_original - I_T_warped) ** 2))
-
         recon_loss = torch.sum(torch.stack(recon_losses))
 
-        # Cycle loss
-        full_trajectories = integrate_velocity_to_deformation(
-            siren_model, sampled_coords, torch.from_numpy(temporal_coords).float().to(device)
-        )
+        # Cycle loss - use same trajectory
         cycle_loss = torch.mean((sampled_coords - full_trajectories[-1]) ** 2)
 
-        # Volume loss (every 50 epochs)
+        # Volume loss (every 50 epochs) - use same trajectory
         volume_loss = 0.0
         if lambda_volume > 0 and epoch % 50 == 0:
-            subset = sampled_coords[:500]
-            t_target = temporal_coords[len(temporal_coords)//2]
-            time_to_frame = torch.linspace(0, t_target, steps=10, device=device)
-            frame_trajectories = integrate_velocity_to_deformation(siren_model, subset, time_to_frame)
-            initial_spread = torch.std(subset, dim=0).mean()
-            final_spread = torch.std(frame_trajectories[-1], dim=0).mean()
+            mid_frame = len(temporal_coords) // 2
+            subset_size = min(500, sampled_coords.shape[0])
+            subset_indices = torch.randperm(sampled_coords.shape[0])[:subset_size]
+            
+            initial_coords = sampled_coords[subset_indices]
+            deformed_coords = full_trajectories[mid_frame][subset_indices]
+            
+            initial_spread = torch.std(initial_coords, dim=0).mean()
+            final_spread = torch.std(deformed_coords, dim=0).mean()
             volume_ratio = (final_spread / initial_spread) ** 3
-            pred_volume = gt_volumes[len(gt_volumes)//2] * volume_ratio.item()
-            volume_loss = (gt_volumes[len(gt_volumes)//2] - pred_volume) ** 2
+            pred_volume = gt_volumes[mid_frame] * volume_ratio.item()
+            volume_loss = (gt_volumes[mid_frame] - pred_volume) ** 2
 
         # Total loss
         total_loss = recon_loss + lambda_cycle * cycle_loss + lambda_volume * volume_loss
@@ -268,9 +264,9 @@ if __name__ == "__main__":
     data = nii.get_fdata().astype(np.float32)
     raw_vertices_mm, mesh_faces, _, _ = measure.marching_cubes(data, level=0.5, spacing=voxel_spacing)
 
-    # Bounding box normalization
-    bbox_min = raw_vertices_mm.min(axis=0)
-    bbox_max = raw_vertices_mm.max(axis=0)
+    # Bounding box normalization - use spatial domain bounds
+    bbox_min = spatial_coords.min(axis=0)
+    bbox_max = spatial_coords.max(axis=0)
     initial_vertices_normalized = normalize_vertices_to_bbox(raw_vertices_mm, bbox_min, bbox_max)
     spatial_coords = normalize_vertices_to_bbox(spatial_coords, bbox_min, bbox_max)
 
