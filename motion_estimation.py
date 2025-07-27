@@ -426,22 +426,29 @@ def train_inr_model(
     """
 
     print(f"Training with {'full volume' if use_full_volume_loss else 'point sampling'} reconstruction for {num_epochs} epochs...")
-
+    print(f"Using device: {device}")
+    print(f"Sample points per epoch: {sample_points}")
+    print(f"Lambda cycle: {lambda_cycle}")
+    
     siren_model = siren_model.to(device)
     optimizer = optim.Adam(siren_model.parameters(), lr=3e-5)
+    print("✓ Model and optimizer initialized")
 
     T = len(frames)
     spatial_coords_torch = torch.from_numpy(spatial_coords).float().to(device)
+    print(f"✓ Loaded {T} frames, spatial coords: {spatial_coords_torch.shape}")
     
     # Convert frames to tensors
     frames_tensor = [torch.from_numpy(frame).float().to(device) for frame in frames]
     target_frame = frames_tensor[-1]  # I_T (final frame)
+    print(f"✓ Converted frames to tensors, target frame shape: {target_frame.shape}")
 
     # For point sampling fallback - balanced sampling indices
     final_mask = (frames[-1].flatten() > 0)
     final_mask_tensor = torch.from_numpy(final_mask).to(device)
     fg_indices = torch.where(final_mask_tensor)[0]
     bg_indices = torch.where(~final_mask_tensor)[0]
+    print(f"✓ Foreground points: {len(fg_indices)}, Background points: {len(bg_indices)}")
 
     def balanced_sample_indices(total_points):
         if len(fg_indices) == 0:
@@ -451,8 +458,15 @@ def train_inr_model(
         bg_sample = bg_indices[torch.randint(0, len(bg_indices), (total_points - half,))]
         return torch.cat([fg_sample, bg_sample])
 
+    print("Starting training loop...")
+    print("=" * 60)
+    
     for epoch in range(num_epochs):
         optimizer.zero_grad()
+        
+        # Progress indicators
+        if epoch == 0:
+            print("🚀 Starting epoch 0...")
 
         if use_full_volume_loss:
             # Paper's exact formulation: ||I_ti ∘ φ_ti→T - I_T||² (memory intensive)
@@ -501,11 +515,18 @@ def train_inr_model(
             
         else:
             # Point sampling approach implementing paper's loss: ||I_ti ∘ φ_ti→T - I_T||²
+            if epoch == 0:
+                print("   🎯 Using point sampling approach")
+                print(f"   📊 Processing {T-1} frame pairs")
+                
             idx = balanced_sample_indices(sample_points)
             sampled_coords = spatial_coords_torch[idx]
             
             recon_losses = []
             for frame_idx in range(T-1):
+                if epoch == 0 and frame_idx < 3:
+                    print(f"      Frame {frame_idx} → target (t={temporal_coords[frame_idx]:.3f} → {temporal_coords[-1]:.3f})")
+                    
                 t_start = temporal_coords[frame_idx]
                 t_end = temporal_coords[-1]
                 time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
@@ -529,6 +550,9 @@ def train_inr_model(
             recon_loss = torch.mean(torch.stack(recon_losses))
 
         # Cycle consistency loss R_cycle
+        if epoch == 0:
+            print("   🔄 Computing cycle consistency loss...")
+            
         # Sample points for cycle loss computation
         cycle_idx = balanced_sample_indices(min(sample_points, 5000))  # Reduce for memory
         cycle_coords = spatial_coords_torch[cycle_idx]
@@ -543,9 +567,7 @@ def train_inr_model(
         total_loss.backward()
         optimizer.step()
 
-        if epoch % 50 == 0 or epoch == num_epochs - 1:
-            print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, "
-                  f"Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
+        print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, "f"Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
 
     print("Training complete.")
     return siren_model
