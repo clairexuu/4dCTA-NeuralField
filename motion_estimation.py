@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import numpy as np
 import nibabel as nib
 import torch
@@ -461,6 +462,8 @@ def train_inr_model(
     print("Starting training loop...")
     print("=" * 60)
     
+    training_start_time = time.time()
+    
     for epoch in range(num_epochs):
         optimizer.zero_grad()
         
@@ -569,7 +572,9 @@ def train_inr_model(
 
         print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, "f"Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
 
-    print("Training complete.")
+    training_end_time = time.time()
+    total_training_time = training_end_time - training_start_time
+    print(f"Training complete! Total time: {total_training_time/60:.1f} minutes ({total_training_time:.1f} seconds)")
     return siren_model
 
 # =========================================================
@@ -622,13 +627,16 @@ if __name__ == "__main__":
     print("Training complete.")
 
     print("=== Step 5: Generating mesh vertex trajectories ===")
+    trajectory_start_time = time.time()
     # Use initial mesh vertices (not all spatial coordinates) for trajectory computation
     mesh_vertices_tensor = torch.from_numpy(initial_vertices_normalized).float().to(device)
     time_tensor = torch.from_numpy(temporal_coords).float().to(device)
     
     print(f"Computing trajectories for {mesh_vertices_tensor.shape[0]} mesh vertices...")
     mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
-    print(f"Mesh trajectories computed: {mesh_trajectories.shape} (T, N_vertices, 3)")
+    trajectory_end_time = time.time()
+    trajectory_time = trajectory_end_time - trajectory_start_time
+    print(f"Mesh trajectories computed: {mesh_trajectories.shape} (T, N_vertices, 3) in {trajectory_time:.1f} seconds")
 
     print("Plotting sample mesh vertex trajectories...")
     traj_plot_path = os.path.join(visualization_path, "mesh_vertex_trajectories.png")
@@ -638,5 +646,9 @@ if __name__ == "__main__":
     plot_point_trajectories(mesh_trajectories, sample_vertex_indices, save_path=traj_plot_path)
 
     print("=== Step 6: Computing and plotting volume comparison ===")
+    plotting_start_time = time.time()
     vol_plot_path = os.path.join(visualization_path, "volume_comparison.png")
     compute_and_plot_volumes(frames, mesh_trajectories, mesh_faces, voxel_spacing, frames[0].shape, save_path=vol_plot_path)
+    plotting_end_time = time.time()
+    plotting_time = plotting_end_time - plotting_start_time
+    print(f"Volume comparison plotting completed in {plotting_time:.1f} seconds")
