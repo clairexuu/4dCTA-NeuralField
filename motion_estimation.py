@@ -145,7 +145,7 @@ def compute_deformation_field(siren_model, spatial_coords, t_start, t_end, devic
         deformation_field: (N, 3) deformed coordinates
     """
     time_points = torch.linspace(t_start, t_end, steps=10, device=device)  # More steps for accuracy
-    coords_tensor = torch.tensor(spatial_coords, dtype=torch.float32, device=device)
+    coords_tensor = torch.from_numpy(spatial_coords).float().to(device)
     trajectories = integrate_velocity_to_deformation(siren_model, coords_tensor, time_points)
     return trajectories[-1]  # Final deformed positions
 
@@ -177,7 +177,7 @@ def warp_volume_full(volume, siren_model, t_start, t_end, device):
     deformed_grid = deformed_coords.reshape(H, W, D, 3)
     
     # Convert volume to tensor format for grid_sample
-    volume_tensor = torch.tensor(volume, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+    volume_tensor = torch.from_numpy(volume).float().to(device).unsqueeze(0).unsqueeze(0)
     
     # Apply grid sampling (note: grid_sample expects (x,y,z) order)
     sampling_grid = deformed_grid.unsqueeze(0)  # (1, H, W, D, 3)
@@ -314,9 +314,10 @@ def normalize_vertices_to_grid(vertices, volume_shape, voxel_spacing):
     verts[:, 2] /= sz  # z
     
     # Convert voxel indices to [-1,1] normalized coordinates
-    verts[:, 0] = (verts[:, 0] / D) * 2 - 1  # x: [0,D] -> [-1,1]
-    verts[:, 1] = (verts[:, 1] / W) * 2 - 1  # y: [0,W] -> [-1,1]
-    verts[:, 2] = (verts[:, 2] / H) * 2 - 1  # z: [0,H] -> [-1,1]
+    # Ensure coordinates are properly clipped to [-1,1] range
+    verts[:, 0] = np.clip((verts[:, 0] / (D-1)) * 2 - 1, -1, 1)  # x: [0,D-1] -> [-1,1]
+    verts[:, 1] = np.clip((verts[:, 1] / (W-1)) * 2 - 1, -1, 1)  # y: [0,W-1] -> [-1,1]
+    verts[:, 2] = np.clip((verts[:, 2] / (H-1)) * 2 - 1, -1, 1)  # z: [0,H-1] -> [-1,1]
     
     return verts
 
@@ -417,11 +418,11 @@ def train_inr_model(
     sample_points=10000,
     lambda_cycle=0.1,
     device='cuda',
-    use_full_volume_loss=True
+    use_full_volume_loss=False  # Disable by default due to memory constraints
 ):
     """
     Training loop implementing paper's exact loss formulation.
-    Uses full volume warping ||I_ti ∘ φ_ti→T - I_T||² as in equation (1).
+    Uses point sampling by default for memory efficiency, with option for full volume warping.
     """
 
     print(f"Training with {'full volume' if use_full_volume_loss else 'point sampling'} reconstruction for {num_epochs} epochs...")
@@ -430,16 +431,17 @@ def train_inr_model(
     optimizer = optim.Adam(siren_model.parameters(), lr=3e-5)
 
     T = len(frames)
-    spatial_coords_torch = torch.tensor(spatial_coords, dtype=torch.float32, device=device)
+    spatial_coords_torch = torch.from_numpy(spatial_coords).float().to(device)
     
     # Convert frames to tensors
-    frames_tensor = [torch.tensor(frame, dtype=torch.float32, device=device) for frame in frames]
+    frames_tensor = [torch.from_numpy(frame).float().to(device) for frame in frames]
     target_frame = frames_tensor[-1]  # I_T (final frame)
 
     # For point sampling fallback - balanced sampling indices
     final_mask = (frames[-1].flatten() > 0)
-    fg_indices = torch.where(torch.tensor(final_mask, device=device))[0]
-    bg_indices = torch.where(~torch.tensor(final_mask, device=device))[0]
+    final_mask_tensor = torch.from_numpy(final_mask).to(device)
+    fg_indices = torch.where(final_mask_tensor)[0]
+    bg_indices = torch.where(~final_mask_tensor)[0]
 
     def balanced_sample_indices(total_points):
         if len(fg_indices) == 0:
@@ -453,25 +455,52 @@ def train_inr_model(
         optimizer.zero_grad()
 
         if use_full_volume_loss:
-            # Paper's exact formulation: ||I_ti ∘ φ_ti→T - I_T||²
+            # Paper's exact formulation: ||I_ti ∘ φ_ti→T - I_T||² (memory intensive)
             recon_losses = []
-            for frame_idx in range(T-1):  # Skip last frame (T-1)
+            # Process fewer frames to save memory
+            frame_step = max(1, (T-1) // 5)  # Process every 5th frame
+            for frame_idx in range(0, T-1, frame_step):
                 t_start = temporal_coords[frame_idx]
                 t_end = temporal_coords[-1]
                 
-                # Warp I_ti using φ_ti→T
-                warped_frame = warp_volume_full(
-                    frames_tensor[frame_idx], siren_model, t_start, t_end, device
-                )
-                
-                # Compute ||I_ti ∘ φ_ti→T - I_T||²
-                frame_loss = torch.mean((warped_frame - target_frame) ** 2)
-                recon_losses.append(frame_loss)
-                
-            recon_loss = torch.mean(torch.stack(recon_losses))
+                try:
+                    # Use reduced resolution for memory efficiency
+                    H, W, D = frames_tensor[frame_idx].shape
+                    if H * W * D > 50000:  # Downsample if too large
+                        downsample_factor = 2
+                        frame_ds = F.avg_pool3d(
+                            frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0),
+                            kernel_size=downsample_factor
+                        ).squeeze(0).squeeze(0)
+                        target_ds = F.avg_pool3d(
+                            target_frame.unsqueeze(0).unsqueeze(0),
+                            kernel_size=downsample_factor
+                        ).squeeze(0).squeeze(0)
+                        warped_frame = warp_volume_full(frame_ds, siren_model, t_start, t_end, device)
+                        frame_loss = torch.mean((warped_frame - target_ds) ** 2)
+                    else:
+                        warped_frame = warp_volume_full(
+                            frames_tensor[frame_idx], siren_model, t_start, t_end, device
+                        )
+                        frame_loss = torch.mean((warped_frame - target_frame) ** 2)
+                        
+                    recon_losses.append(frame_loss)
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"Warning: OOM at frame {frame_idx}, switching to point sampling")
+                        torch.cuda.empty_cache()
+                        use_full_volume_loss = False
+                        break
+                    else:
+                        raise e
+                        
+            if recon_losses:
+                recon_loss = torch.mean(torch.stack(recon_losses))
+            else:
+                use_full_volume_loss = False
             
         else:
-            # Fallback: point sampling approach (original implementation)
+            # Point sampling approach implementing paper's loss: ||I_ti ∘ φ_ti→T - I_T||²
             idx = balanced_sample_indices(sample_points)
             sampled_coords = spatial_coords_torch[idx]
             
@@ -481,17 +510,21 @@ def train_inr_model(
                 t_end = temporal_coords[-1]
                 time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
 
+                # Compute forward deformation φ_ti→T(P)
                 trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
                 warped_points = trajectories[-1]
 
-                I_src = sample_intensity(
-                    frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), sampled_coords
+                # Paper's loss: ||I_ti(φ_ti→T(P)) - I_T(P)||²
+                # Sample I_ti at deformed locations φ_ti→T(P)
+                I_ti_warped = sample_intensity(
+                    frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), warped_points
                 )
-                I_target = sample_intensity(
-                    target_frame.unsqueeze(0).unsqueeze(0), warped_points
+                # Sample I_T at original locations P
+                I_T_original = sample_intensity(
+                    target_frame.unsqueeze(0).unsqueeze(0), sampled_coords
                 )
 
-                recon_losses.append(torch.mean((I_src - I_target) ** 2))
+                recon_losses.append(torch.mean((I_ti_warped - I_T_original) ** 2))
 
             recon_loss = torch.mean(torch.stack(recon_losses))
 
@@ -501,7 +534,7 @@ def train_inr_model(
         cycle_coords = spatial_coords_torch[cycle_idx]
         
         full_trajectories = integrate_velocity_to_deformation(
-            siren_model, cycle_coords, torch.tensor(temporal_coords, device=device)
+            siren_model, cycle_coords, torch.from_numpy(temporal_coords).float().to(device)
         )
         cycle_loss = torch.mean((cycle_coords - full_trajectories[-1]) ** 2)
 
@@ -552,23 +585,24 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     print("=== Step 4: Training SIREN model ===")
+    # Start with point sampling due to memory constraints
     trained_model = train_inr_model(
         siren_model,
         frames,
         spatial_coords,
         temporal_coords,
         num_epochs=1000,
-        sample_points=10000,
+        sample_points=10000,  # Reduced for memory efficiency
         lambda_cycle=0.1,
         device=device,
-        use_full_volume_loss=True  # Use paper's exact formulation
+        use_full_volume_loss=False  # Use point sampling for stability
     )
     print("Training complete.")
 
     print("=== Step 5: Generating mesh vertex trajectories ===")
     # Use initial mesh vertices (not all spatial coordinates) for trajectory computation
-    mesh_vertices_tensor = torch.tensor(initial_vertices_normalized, dtype=torch.float32, device=device)
-    time_tensor = torch.tensor(temporal_coords, dtype=torch.float32, device=device)
+    mesh_vertices_tensor = torch.from_numpy(initial_vertices_normalized).float().to(device)
+    time_tensor = torch.from_numpy(temporal_coords).float().to(device)
     
     print(f"Computing trajectories for {mesh_vertices_tensor.shape[0]} mesh vertices...")
     mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
