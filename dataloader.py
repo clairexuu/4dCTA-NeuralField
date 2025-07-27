@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import nibabel as nib
 
 class CTSequenceDataset:
     """
@@ -45,16 +47,26 @@ class CTSequenceDataset:
                 self.voxel_spacing = nii.header.get_zooms()
 
     def _compute_coords(self):
-        """Compute spatial and temporal normalized coordinates separately."""
-        # Spatial coords based on first frame shape
+        """Compute spatial and temporal normalized coordinates following paper exactly."""
+        # Paper's spatial normalization: coordinates normalized to [-1,1]^3
+        # Using consistent grid generation as in paper's spatial domain Ω⊂R^3
         H, W, D = self.frames[0].shape
-        z = np.linspace(-1, 1, H)
-        y = np.linspace(-1, 1, W)
-        x = np.linspace(-1, 1, D)
+        
+        # Generate spatial coordinates in [-1,1]^3 following paper's normalization
+        # Note: using consistent indexing with paper's coordinate system
+        z = np.linspace(-1, 1, H)  # z-axis (depth)
+        y = np.linspace(-1, 1, W)  # y-axis (height) 
+        x = np.linspace(-1, 1, D)  # x-axis (width)
+        
+        # Create meshgrid with 'ij' indexing for consistency with paper
         zz, yy, xx = np.meshgrid(z, y, x, indexing='ij')
+        
+        # Stack coordinates as (x, y, z) following paper's coordinate convention
+        # Paper uses P̂ = (x, y, z) ∈ R^3
         self.spatial_coords = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
 
-        # Temporal coords normalized to [0,1]
+        # Temporal coords normalized to [0,1] as per paper: time horizon T
+        # Paper: "time points t0, t1, ..., tN−1 were equally spaced and normalized to the [0,1] interval"
         self.temporal_coords = np.linspace(0, 1, self.num_frames, dtype=np.float32)
 
     def get_frame(self, idx):
@@ -66,8 +78,44 @@ class CTSequenceDataset:
         return self.frames, self.temporal_coords
 
     def get_spatial_coords(self):
-        """Return normalized spatial coordinates ([-1,1]^3)."""
+        """Return normalized spatial coordinates ([-1,1]^3) as per paper."""
         return self.spatial_coords
+    
+    def get_spatial_coords_grid(self):
+        """Return spatial coordinates in grid format (H, W, D, 3) for volume operations."""
+        H, W, D = self.frames[0].shape
+        return self.spatial_coords.reshape(H, W, D, 3)
+    
+    def sample_points_uniformly(self, num_points):
+        """Sample points uniformly from spatial domain as per paper's sampling strategy."""
+        total_points = self.spatial_coords.shape[0]
+        indices = np.random.choice(total_points, size=min(num_points, total_points), replace=False)
+        return self.spatial_coords[indices], indices
+    
+    def sample_points_from_mask(self, mask, num_points, fg_ratio=0.5):
+        """Sample points with foreground/background balance as per paper's strategy."""
+        mask_flat = mask.flatten()
+        fg_indices = np.where(mask_flat > 0)[0]
+        bg_indices = np.where(mask_flat == 0)[0]
+        
+        if len(fg_indices) == 0:
+            # No foreground, sample uniformly
+            return self.sample_points_uniformly(num_points)
+        
+        num_fg = int(num_points * fg_ratio)
+        num_bg = num_points - num_fg
+        
+        # Sample foreground points
+        fg_sample_indices = np.random.choice(fg_indices, size=min(num_fg, len(fg_indices)), replace=True)
+        
+        # Sample background points
+        bg_sample_indices = np.random.choice(bg_indices, size=min(num_bg, len(bg_indices)), replace=True)
+        
+        # Combine indices
+        all_indices = np.concatenate([fg_sample_indices, bg_sample_indices])
+        np.random.shuffle(all_indices)
+        
+        return self.spatial_coords[all_indices], all_indices
 
     def get_voxel_spacing(self):
         """Return voxel spacing (mm)."""
