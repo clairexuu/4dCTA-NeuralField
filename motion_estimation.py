@@ -58,15 +58,41 @@ def encode_time(t):
 class SIRENVelocityField(nn.Module):
     def __init__(self, hidden_dim=256, num_layers=3, w0=30.0):
         super().__init__()
+        self.w0 = w0
         layers = []
         in_dim = 5  # (x,y,z, cos t, sin t)
         layers.append(nn.Linear(in_dim, hidden_dim))
         layers.append(SineActivation(w0=w0))
         for _ in range(num_layers-1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(SineActivation(w0=1.0))
+            layers.append(SineActivation(w0=w0))  # Use same w0 for all layers per paper
         layers.append(nn.Linear(hidden_dim, 3))
         self.model = nn.Sequential(*layers)
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights according to SIREN paper."""
+        with torch.no_grad():
+            # First layer: uniform distribution from [-1/in_dim, 1/in_dim]
+            first_linear = None
+            for layer in self.model:
+                if isinstance(layer, nn.Linear):
+                    first_linear = layer
+                    break
+            
+            if first_linear is not None:
+                bound = 1 / first_linear.in_features
+                first_linear.weight.uniform_(-bound, bound)
+            
+            # Hidden layers: uniform distribution from [-sqrt(6/hidden_dim)/w0, sqrt(6/hidden_dim)/w0]
+            is_first = True
+            for layer in self.model:
+                if isinstance(layer, nn.Linear):
+                    if is_first:
+                        is_first = False
+                        continue  # Skip first layer, already initialized
+                    bound = math.sqrt(6 / layer.in_features) / self.w0
+                    layer.weight.uniform_(-bound, bound)
     def forward(self, coords, t):
         t_enc = encode_time(t)
         # Broadcast time encoding to match coords batch size
@@ -251,9 +277,24 @@ def compute_and_plot_volumes(frames, mesh_trajectories, mesh_faces, voxel_spacin
         verts_pred_norm = mesh_trajectories[t].detach().cpu().numpy()
         # Enable debug for first frame only to avoid spam
         debug_denorm = (t == 0)
+        
+        # Debug: Print original vertices before any processing
+        if debug_denorm:
+            print(f"📋 Original vertices (normalized [-1,1]³) at frame {t}:")
+            print(f"   Shape: {verts_pred_norm.shape}")
+            print(f"   Range: X=[{verts_pred_norm[:,0].min():.3f}, {verts_pred_norm[:,0].max():.3f}]")
+            print(f"          Y=[{verts_pred_norm[:,1].min():.3f}, {verts_pred_norm[:,1].max():.3f}]")
+            print(f"          Z=[{verts_pred_norm[:,2].min():.3f}, {verts_pred_norm[:,2].max():.3f}]")
+            print(f"   First 3 original vertices:")
+            for i in range(min(3, verts_pred_norm.shape[0])):
+                print(f"      [{i}]: ({verts_pred_norm[i,0]:.3f}, {verts_pred_norm[i,1]:.3f}, {verts_pred_norm[i,2]:.3f})")
+        
         verts_pred_mm = denormalize_vertices(verts_pred_norm, spatial_shape, voxel_spacing, debug=debug_denorm)
         pred_volumes.append(abs(compute_mesh_volume(verts_pred_mm, mesh_faces)))
 
+    # Create frame indices array
+    frames_idx = np.arange(num_frames)
+    
     # Save volume data to CSV
     if save_path:
         # Create DataFrame with volume data
@@ -279,7 +320,6 @@ def compute_and_plot_volumes(frames, mesh_trajectories, mesh_faces, voxel_spacin
         print(f"   Mean Percent Error: {np.mean(np.abs(volume_data['volume_diff_percent'])):.2f}%")
 
     # Plot
-    frames_idx = np.arange(num_frames)
     plt.figure(figsize=(6, 4))
     plt.plot(frames_idx, gt_volumes, 'o-', color='orange', label="Reference")
     plt.plot(frames_idx, pred_volumes, 'o-', color='blue', label="Predicted")
@@ -385,17 +425,17 @@ def train_inr_model(
             trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
             warped_points = trajectories[-1]
 
-            # Paper's loss: ||I_ti(φ_ti→T(P)) - I_T(P)||²
-            # Sample I_ti at deformed locations φ_ti→T(P)
-            I_ti_warped = sample_intensity(
-                frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), warped_points
+            # Paper's loss: ||I_ti ∘ φ_ti→T - I_T||² = ||I_ti(P) - I_T(φ_ti→T(P))||²
+            # Sample I_ti at original locations P
+            I_ti_original = sample_intensity(
+                frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), sampled_coords
             )
-            # Sample I_T at original locations P
-            I_T_original = sample_intensity(
-                target_frame.unsqueeze(0).unsqueeze(0), sampled_coords
+            # Sample I_T at deformed locations φ_ti→T(P)
+            I_T_warped = sample_intensity(
+                target_frame.unsqueeze(0).unsqueeze(0), warped_points
             )
 
-            recon_losses.append(torch.sum((I_ti_warped - I_T_original) ** 2))
+            recon_losses.append(torch.sum((I_ti_original - I_T_warped) ** 2))
 
         recon_loss = torch.sum(torch.stack(recon_losses))
             
@@ -440,6 +480,20 @@ if __name__ == "__main__":
     print("=== Step 2.5: Extracting and normalizing initial mesh vertices ===")
     # Extract mesh vertices from initial frame (0pct) and normalize to [-1,1]^3
     initial_nifti_path = os.path.join(data_path, "0pct.nii.gz")
+    
+    # Debug: Show raw vertices from marching cubes before any transformation
+    nii = nib.load(initial_nifti_path)
+    data = nii.get_fdata().astype(np.float32)
+    raw_vertices_mm, faces_raw, _, _ = measure.marching_cubes(data, level=0.5, spacing=voxel_spacing)
+    print(f"🔬 Raw vertices from marching cubes (mm coordinates):")
+    print(f"   Shape: {raw_vertices_mm.shape}")
+    print(f"   Range: X=[{raw_vertices_mm[:,0].min():.3f}, {raw_vertices_mm[:,0].max():.3f}] mm")
+    print(f"          Y=[{raw_vertices_mm[:,1].min():.3f}, {raw_vertices_mm[:,1].max():.3f}] mm")
+    print(f"          Z=[{raw_vertices_mm[:,2].min():.3f}, {raw_vertices_mm[:,2].max():.3f}] mm")
+    print(f"   First 3 raw vertices:")
+    for i in range(min(3, raw_vertices_mm.shape[0])):
+        print(f"      [{i}]: ({raw_vertices_mm[i,0]:.3f}, {raw_vertices_mm[i,1]:.3f}, {raw_vertices_mm[i,2]:.3f}) mm")
+    
     initial_vertices_normalized, mesh_faces = extract_and_normalize_initial_mesh(
         initial_nifti_path, frames[0].shape, voxel_spacing
     )
