@@ -2,6 +2,7 @@ import os
 import math
 import time
 import numpy as np
+import pandas as pd
 import nibabel as nib
 import torch
 import torch.nn as nn
@@ -17,43 +18,6 @@ import matplotlib.pyplot as plt
 from dataloader import CTSequenceDataset
 
 
-# =========================================================
-# 1. Data Loading & Normalization
-# =========================================================
-def load_4d_cta(dataset_path):
-    frames = []
-    for i in range(20):
-        filename = f"{i*5}pct.nii.gz"
-        file_path = os.path.join(dataset_path, filename)
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Missing file: {file_path}")
-        img = nib.load(file_path)
-        data = img.get_fdata().astype(np.float32)
-        frames.append(data)
-
-    # Stack frames into 4D array: (T, H, W, D)
-    volume_4d = np.stack(frames, axis=0)  # (20,H,W,D)
-
-    # Normalize intensity to [0,1]
-    min_val = np.min(volume_4d)
-    max_val = np.max(volume_4d)
-    volume_4d = (volume_4d - min_val) / (max_val - min_val + 1e-8)
-
-    return volume_4d
-
-
-def normalize_spatial_coordinates(shape):
-    H, W, D = shape
-    z = np.linspace(-1, 1, H)
-    y = np.linspace(-1, 1, W)
-    x = np.linspace(-1, 1, D)
-    zz, yy, xx = np.meshgrid(z, y, x, indexing='ij')
-    coords = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
-    return coords
-
-
-def normalize_temporal_coordinates(num_frames=20):
-    return np.linspace(0, 1, num_frames, dtype=np.float32)
 
 
 # =========================================================
@@ -132,81 +96,8 @@ def integrate_velocity_to_deformation(siren_model, points, time_points, method='
 
 
 # =========================================================
-# 5. Warping Functions
+# 5. Point Sampling Functions
 # =========================================================
-def compute_deformation_field(siren_model, spatial_coords, t_start, t_end, device):
-    """
-    Compute deformation field φ_t_start→t_end for all spatial coordinates.
-    Args:
-        siren_model: trained SIREN velocity field
-        spatial_coords: (N, 3) normalized spatial coordinates
-        t_start, t_end: scalar time values
-        device: torch device
-    Returns:
-        deformation_field: (N, 3) deformed coordinates
-    """
-    time_points = torch.linspace(t_start, t_end, steps=10, device=device)  # More steps for accuracy
-    coords_tensor = torch.from_numpy(spatial_coords).float().to(device)
-    trajectories = integrate_velocity_to_deformation(siren_model, coords_tensor, time_points)
-    return trajectories[-1]  # Final deformed positions
-
-def warp_volume_full(volume, siren_model, t_start, t_end, device):
-    """
-    Warp entire volume using deformation field φ_t_start→t_end.
-    Implements paper's ||I_ti ∘ φ_ti→T - I_T||² formulation.
-    Args:
-        volume: (H, W, D) input volume
-        siren_model: trained SIREN velocity field
-        t_start, t_end: scalar time values
-        device: torch device
-    Returns:
-        warped_volume: (H, W, D) warped volume
-    """
-    H, W, D = volume.shape
-    
-    # Create normalized spatial grid [-1,1]³
-    z = torch.linspace(-1, 1, H, device=device)
-    y = torch.linspace(-1, 1, W, device=device) 
-    x = torch.linspace(-1, 1, D, device=device)
-    zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
-    spatial_coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
-    
-    # Compute deformation field
-    deformed_coords = compute_deformation_field(siren_model, spatial_coords, t_start, t_end, device)
-    
-    # Reshape to grid format and apply warping
-    deformed_grid = deformed_coords.reshape(H, W, D, 3)
-    
-    # Convert volume to tensor format for grid_sample
-    volume_tensor = torch.from_numpy(volume).float().to(device).unsqueeze(0).unsqueeze(0)
-    
-    # Apply grid sampling (note: grid_sample expects (x,y,z) order)
-    sampling_grid = deformed_grid.unsqueeze(0)  # (1, H, W, D, 3)
-    warped = F.grid_sample(
-        volume_tensor, sampling_grid, 
-        align_corners=True, mode='bilinear', padding_mode='border'
-    )
-    
-    return warped.squeeze(0).squeeze(0)  # Remove batch and channel dims
-
-def warp_volume(volume, deformation, volume_shape):
-    """Legacy function - kept for backward compatibility"""
-    H, W, D = volume_shape
-    grid_z, grid_y, grid_x = torch.meshgrid(
-        torch.linspace(-1,1,H), torch.linspace(-1,1,W), torch.linspace(-1,1,D), indexing='ij'
-    )
-    base_grid = torch.stack((grid_x, grid_y, grid_z), dim=-1).to(volume.device)
-    displacement = deformation.reshape(H,W,D,3) - base_grid
-    sampling_grid = base_grid + displacement
-    sampling_grid = sampling_grid.unsqueeze(0)  # (1,H,W,D,3)
-    warped = F.grid_sample(
-        volume, sampling_grid.permute(0,4,1,2,3), align_corners=True,
-        mode='bilinear', padding_mode='border'
-    )
-    return warped
-
-def warp_mesh(vertices, trajectories, time_idx):
-    return trajectories[time_idx]
 
 
 # Function to sample intensities at arbitrary coordinates
@@ -222,45 +113,13 @@ def sample_intensity(volume, coords):
     return sampled.view(-1)
 
 
-# =========================================================
-# 6. Loss Functions
-# =========================================================
-def reconstruction_loss(warped_volume, target_volume):
-    return torch.mean((warped_volume - target_volume) ** 2)
-
-def cycle_consistency_loss(initial_points, trajectories):
-    final_positions = trajectories[-1]
-    return torch.mean((initial_points - final_positions) ** 2)
 
 
-# =========================================================
-# 7. Evaluation Metrics
-# =========================================================
-def compute_psnr(pred, target, max_val=1.0):
-    mse = torch.mean((pred - target) ** 2).item()
-    if mse == 0:
-        return float('inf')
-    return 20 * math.log10(max_val / math.sqrt(mse))
-
-def compute_hausdorff_distance(points_A, points_B):
-    d_AB = directed_hausdorff(points_A, points_B)[0]
-    d_BA = directed_hausdorff(points_B, points_A)[0]
-    return max(d_AB, d_BA)
 
 
 # =========================================================
 # 8. Visualization Utilities
 # =========================================================
-def visualize_mesh_overlay(volume, mesh_vertices, mesh_faces, save_path=None):
-    faces_flat = np.hstack([np.full((mesh_faces.shape[0],1),3), mesh_faces]).flatten()
-    pv_mesh = pv.PolyData(mesh_vertices, faces_flat)
-    plotter = pv.Plotter(off_screen=True)  # offscreen rendering
-    plotter.add_volume(volume, cmap="gray", opacity="linear")
-    plotter.add_mesh(pv_mesh, color="red", opacity=0.5)
-    if save_path:
-        plotter.screenshot(save_path)
-        print(f"Saved mesh overlay to {save_path}")
-    plotter.show()
 
 def plot_point_trajectories(trajectories, point_indices, save_path=None):
     traj_np = trajectories.detach().cpu().numpy()
@@ -279,21 +138,6 @@ def compute_mesh_volume(vertices, faces):
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return abs(mesh.volume)
 
-def plot_volume_comparison(volumes_gt, volumes_pred, save_path=None, title="Volume Comparison"):
-    frames = np.arange(len(volumes_gt))
-    plt.figure(figsize=(6,4))
-    plt.plot(frames, volumes_gt, 'o-', color='orange', label="Reference")
-    plt.plot(frames, volumes_pred, 'o-', color='blue', label="Predicted")
-    plt.xlabel("Frame (time)")
-    plt.ylabel("Volume (mm³)")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved volume comparison plot to {save_path}")
-    plt.show()
 
 def normalize_vertices_to_grid(vertices, volume_shape, voxel_spacing):
     """
@@ -322,12 +166,21 @@ def normalize_vertices_to_grid(vertices, volume_shape, voxel_spacing):
     
     return verts
 
-def denormalize_vertices(vertices, volume_shape, voxel_spacing):
+def denormalize_vertices(vertices, volume_shape, voxel_spacing, debug=False):
     """
     Convert normalized [-1,1] coordinates to real-world mm space
     """
     H, W, D = volume_shape
     sx, sy, sz = voxel_spacing  # from nii.header.get_zooms()
+    
+    if debug:
+        print(f"🔍 Denormalize Debug:")
+        print(f"   Volume shape: {volume_shape} (H={H}, W={W}, D={D})")
+        print(f"   Voxel spacing: {voxel_spacing} (sx={sx:.3f}, sy={sy:.3f}, sz={sz:.3f}) mm")
+        print(f"   Input vertices shape: {vertices.shape}")
+        print(f"   First 3 normalized vertices:")
+        for i in range(min(3, vertices.shape[0])):
+            print(f"      [{i}]: ({vertices[i,0]:.3f}, {vertices[i,1]:.3f}, {vertices[i,2]:.3f})")
 
     # Convert [-1,1] -> [0,H/W/D]
     verts = (vertices + 1) / 2.0
@@ -339,6 +192,15 @@ def denormalize_vertices(vertices, volume_shape, voxel_spacing):
     verts[:, 0] *= sx
     verts[:, 1] *= sy
     verts[:, 2] *= sz
+
+    if debug:
+        print(f"   First 3 denormalized vertices (mm):")
+        for i in range(min(3, verts.shape[0])):
+            print(f"      [{i}]: ({verts[i,0]:.3f}, {verts[i,1]:.3f}, {verts[i,2]:.3f})")
+        print(f"   Coordinate ranges after denormalization:")
+        print(f"      X: [{verts[:,0].min():.3f}, {verts[:,0].max():.3f}] mm")
+        print(f"      Y: [{verts[:,1].min():.3f}, {verts[:,1].max():.3f}] mm") 
+        print(f"      Z: [{verts[:,2].min():.3f}, {verts[:,2].max():.3f}] mm")
 
     return verts
 
@@ -387,8 +249,34 @@ def compute_and_plot_volumes(frames, mesh_trajectories, mesh_faces, voxel_spacin
     # Predicted: mesh trajectories → mm
     for t in range(num_frames):
         verts_pred_norm = mesh_trajectories[t].detach().cpu().numpy()
-        verts_pred_mm = denormalize_vertices(verts_pred_norm, spatial_shape, voxel_spacing)
+        # Enable debug for first frame only to avoid spam
+        debug_denorm = (t == 0)
+        verts_pred_mm = denormalize_vertices(verts_pred_norm, spatial_shape, voxel_spacing, debug=debug_denorm)
         pred_volumes.append(abs(compute_mesh_volume(verts_pred_mm, mesh_faces)))
+
+    # Save volume data to CSV
+    if save_path:
+        # Create DataFrame with volume data
+        volume_data = pd.DataFrame({
+            'frame': frames_idx,
+            'time_phase': frames_idx / (num_frames - 1),  # Normalized time [0,1]
+            'gt_volume_mm3': gt_volumes,
+            'predicted_volume_mm3': pred_volumes,
+            'volume_diff_mm3': np.array(pred_volumes) - np.array(gt_volumes),
+            'volume_diff_percent': ((np.array(pred_volumes) - np.array(gt_volumes)) / np.array(gt_volumes)) * 100
+        })
+        
+        # Save CSV
+        csv_path = save_path.replace('.png', '.csv')
+        volume_data.to_csv(csv_path, index=False, float_format='%.3f')
+        print(f"Saved volume data to {csv_path}")
+        
+        # Print summary statistics
+        print(f"📊 Volume Statistics:")
+        print(f"   GT Volume Range: {min(gt_volumes):.1f} - {max(gt_volumes):.1f} mm³")
+        print(f"   Predicted Volume Range: {min(pred_volumes):.1f} - {max(pred_volumes):.1f} mm³")
+        print(f"   Mean Absolute Error: {np.mean(np.abs(volume_data['volume_diff_mm3'])):.3f} mm³")
+        print(f"   Mean Percent Error: {np.mean(np.abs(volume_data['volume_diff_percent'])):.2f}%")
 
     # Plot
     frames_idx = np.arange(num_frames)
@@ -418,15 +306,13 @@ def train_inr_model(
     num_epochs=1000,
     sample_points=10000,
     lambda_cycle=0.1,
-    device='cuda',
-    use_full_volume_loss=False  # Disable by default due to memory constraints
+    device='cuda'
 ):
     """
-    Training loop implementing paper's exact loss formulation.
-    Uses point sampling by default for memory efficiency, with option for full volume warping.
+    Training loop implementing paper's exact loss formulation using point sampling.
     """
 
-    print(f"Training with {'full volume' if use_full_volume_loss else 'point sampling'} reconstruction for {num_epochs} epochs...")
+    print(f"Training with point sampling reconstruction for {num_epochs} epochs...")
     print(f"Using device: {device}")
     print(f"Sample points per epoch: {sample_points}")
     print(f"Lambda cycle: {lambda_cycle}")
@@ -444,20 +330,24 @@ def train_inr_model(
     target_frame = frames_tensor[-1]  # I_T (final frame)
     print(f"✓ Converted frames to tensors, target frame shape: {target_frame.shape}")
 
-    # For point sampling fallback - balanced sampling indices
-    final_mask = (frames[-1].flatten() > 0)
-    final_mask_tensor = torch.from_numpy(final_mask).to(device)
-    fg_indices = torch.where(final_mask_tensor)[0]
-    bg_indices = torch.where(~final_mask_tensor)[0]
-    print(f"✓ Foreground points: {len(fg_indices)}, Background points: {len(bg_indices)}")
-
-    def balanced_sample_indices(total_points):
-        if len(fg_indices) == 0:
-            return torch.randint(0, spatial_coords_torch.shape[0], (total_points,), device=device)
-        half = total_points // 2
-        fg_sample = fg_indices[torch.randint(0, len(fg_indices), (half,))]
-        bg_sample = bg_indices[torch.randint(0, len(bg_indices), (total_points - half,))]
-        return torch.cat([fg_sample, bg_sample])
+    # Paper: "10000 (real dataset) randomly sampled points in the spatial domain"
+    # Using pure random sampling as specified in the paper
+    def random_sample_indices(total_points):
+        return torch.randint(0, spatial_coords_torch.shape[0], (total_points,), device=device)
+    
+    # # Alternative: Balanced foreground/background sampling (commented out)
+    # final_mask = (frames[-1].flatten() > 0)
+    # final_mask_tensor = torch.from_numpy(final_mask).to(device)
+    # fg_indices = torch.where(final_mask_tensor)[0]
+    # bg_indices = torch.where(~final_mask_tensor)[0]
+    # print(f"✓ Foreground points: {len(fg_indices)}, Background points: {len(bg_indices)}")
+    # def balanced_sample_indices(total_points):
+    #     if len(fg_indices) == 0:
+    #         return torch.randint(0, spatial_coords_torch.shape[0], (total_points,), device=device)
+    #     half = total_points // 2
+    #     fg_sample = fg_indices[torch.randint(0, len(fg_indices), (half,))]
+    #     bg_sample = bg_indices[torch.randint(0, len(bg_indices), (total_points - half,))]
+    #     return torch.cat([fg_sample, bg_sample])
 
     print("Starting training loop...")
     print("=" * 60)
@@ -471,99 +361,49 @@ def train_inr_model(
         if epoch == 0:
             print("🚀 Starting epoch 0...")
 
-        if use_full_volume_loss:
-            # Paper's exact formulation: ||I_ti ∘ φ_ti→T - I_T||² (memory intensive)
-            recon_losses = []
-            # Process fewer frames to save memory
-            frame_step = max(1, (T-1) // 5)  # Process every 5th frame
-            for frame_idx in range(0, T-1, frame_step):
-                t_start = temporal_coords[frame_idx]
-                t_end = temporal_coords[-1]
-                
-                try:
-                    # Use reduced resolution for memory efficiency
-                    H, W, D = frames_tensor[frame_idx].shape
-                    if H * W * D > 50000:  # Downsample if too large
-                        downsample_factor = 2
-                        frame_ds = F.avg_pool3d(
-                            frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0),
-                            kernel_size=downsample_factor
-                        ).squeeze(0).squeeze(0)
-                        target_ds = F.avg_pool3d(
-                            target_frame.unsqueeze(0).unsqueeze(0),
-                            kernel_size=downsample_factor
-                        ).squeeze(0).squeeze(0)
-                        warped_frame = warp_volume_full(frame_ds, siren_model, t_start, t_end, device)
-                        frame_loss = torch.mean((warped_frame - target_ds) ** 2)
-                    else:
-                        warped_frame = warp_volume_full(
-                            frames_tensor[frame_idx], siren_model, t_start, t_end, device
-                        )
-                        frame_loss = torch.mean((warped_frame - target_frame) ** 2)
-                        
-                    recon_losses.append(frame_loss)
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print(f"Warning: OOM at frame {frame_idx}, switching to point sampling")
-                        torch.cuda.empty_cache()
-                        use_full_volume_loss = False
-                        break
-                    else:
-                        raise e
-                        
-            if recon_losses:
-                recon_loss = torch.mean(torch.stack(recon_losses))
-            else:
-                use_full_volume_loss = False
+        # Point sampling approach implementing paper's loss: ||I_ti ∘ φ_ti→T - I_T||²        
+        idx = random_sample_indices(sample_points)
+        sampled_coords = spatial_coords_torch[idx]
+
+        # Debug: Print first 5 sampled coordinates at specific epochs
+        if epoch in [0, 500, 999]:
+            print(f"   📍 Epoch {epoch} - First 5 sampled coords:")
+            for i in range(5):
+                coord = sampled_coords[i].cpu().numpy()
+                print(f"      [{i}]: ({coord[0]:.3f}, {coord[1]:.3f}, {coord[2]:.3f})")
             
-        else:
-            # Point sampling approach implementing paper's loss: ||I_ti ∘ φ_ti→T - I_T||²
-            if epoch == 0:
-                print("   🎯 Using point sampling approach")
-                print(f"   📊 Processing {T-1} frame pairs")
-                
-            idx = balanced_sample_indices(sample_points)
-            sampled_coords = spatial_coords_torch[idx]
-            
-            recon_losses = []
-            for frame_idx in range(T-1):
-                if epoch == 0 and frame_idx < 3:
-                    print(f"      Frame {frame_idx} → target (t={temporal_coords[frame_idx]:.3f} → {temporal_coords[-1]:.3f})")
+        recon_losses = []
+        for frame_idx in range(T-1):
+            if epoch == 0 and frame_idx < 3:
+                print(f"      Frame {frame_idx} → target (t={temporal_coords[frame_idx]:.3f} → {temporal_coords[-1]:.3f})")
                     
-                t_start = temporal_coords[frame_idx]
-                t_end = temporal_coords[-1]
-                time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
+            t_start = temporal_coords[frame_idx]
+            t_end = temporal_coords[-1]
+            time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
 
-                # Compute forward deformation φ_ti→T(P)
-                trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
-                warped_points = trajectories[-1]
+            # Compute forward deformation φ_ti→T(P)
+            trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
+            warped_points = trajectories[-1]
 
-                # Paper's loss: ||I_ti(φ_ti→T(P)) - I_T(P)||²
-                # Sample I_ti at deformed locations φ_ti→T(P)
-                I_ti_warped = sample_intensity(
-                    frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), warped_points
-                )
-                # Sample I_T at original locations P
-                I_T_original = sample_intensity(
-                    target_frame.unsqueeze(0).unsqueeze(0), sampled_coords
-                )
+            # Paper's loss: ||I_ti(φ_ti→T(P)) - I_T(P)||²
+            # Sample I_ti at deformed locations φ_ti→T(P)
+            I_ti_warped = sample_intensity(
+                frames_tensor[frame_idx].unsqueeze(0).unsqueeze(0), warped_points
+            )
+            # Sample I_T at original locations P
+            I_T_original = sample_intensity(
+                target_frame.unsqueeze(0).unsqueeze(0), sampled_coords
+            )
 
-                recon_losses.append(torch.mean((I_ti_warped - I_T_original) ** 2))
+            recon_losses.append(torch.sum((I_ti_warped - I_T_original) ** 2))
 
-            recon_loss = torch.mean(torch.stack(recon_losses))
-
-        # Cycle consistency loss R_cycle
-        if epoch == 0:
-            print("   🔄 Computing cycle consistency loss...")
+        recon_loss = torch.sum(torch.stack(recon_losses))
             
-        # Sample points for cycle loss computation
-        cycle_idx = balanced_sample_indices(min(sample_points, 5000))  # Reduce for memory
-        cycle_coords = spatial_coords_torch[cycle_idx]
-        
+        # Use same points for cycle loss to ensure consistent optimization
         full_trajectories = integrate_velocity_to_deformation(
-            siren_model, cycle_coords, torch.from_numpy(temporal_coords).float().to(device)
+            siren_model, sampled_coords, torch.from_numpy(temporal_coords).float().to(device)
         )
-        cycle_loss = torch.mean((cycle_coords - full_trajectories[-1]) ** 2)
+        cycle_loss = torch.mean((sampled_coords - full_trajectories[-1]) ** 2)
 
         # Total loss: reconstruction + λ * cycle
         total_loss = recon_loss + lambda_cycle * cycle_loss
@@ -619,21 +459,24 @@ if __name__ == "__main__":
         spatial_coords,
         temporal_coords,
         num_epochs=1000,
-        sample_points=10000,  # Reduced for memory efficiency
+        sample_points=10000,
         lambda_cycle=0.1,
-        device=device,
-        use_full_volume_loss=False  # Use point sampling for stability
+        device=device
     )
     print("Training complete.")
 
     print("=== Step 5: Generating mesh vertex trajectories ===")
+    # Set model to evaluation mode for inference
+    trained_model.eval()
+    
     trajectory_start_time = time.time()
     # Use initial mesh vertices (not all spatial coordinates) for trajectory computation
     mesh_vertices_tensor = torch.from_numpy(initial_vertices_normalized).float().to(device)
     time_tensor = torch.from_numpy(temporal_coords).float().to(device)
     
     print(f"Computing trajectories for {mesh_vertices_tensor.shape[0]} mesh vertices...")
-    mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
+    with torch.no_grad():  # Disable gradients for inference
+        mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
     trajectory_end_time = time.time()
     trajectory_time = trajectory_end_time - trajectory_start_time
     print(f"Mesh trajectories computed: {mesh_trajectories.shape} (T, N_vertices, 3) in {trajectory_time:.1f} seconds")
