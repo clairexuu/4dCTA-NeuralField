@@ -13,6 +13,8 @@ from scipy.spatial.distance import directed_hausdorff
 import pyvista as pv
 import matplotlib.pyplot as plt
 
+from dataloader import CTSequenceDataset
+
 
 # =========================================================
 # 1. Data Loading & Normalization
@@ -145,6 +147,19 @@ def warp_mesh(vertices, trajectories, time_idx):
     return trajectories[time_idx]
 
 
+# Function to sample intensities at arbitrary coordinates
+def sample_intensity(volume, coords):
+    """
+    volume: (1,1,H,W,D)
+    coords: (N,3) in [-1,1]^3
+    Returns: (N,) interpolated intensities
+    """
+    # Reshape coords to (1,D,H,W,3) format expected by grid_sample
+    coords = coords.view(1, -1, 1, 1, 3)  # fake dimensions for 5D
+    sampled = F.grid_sample(volume, coords, align_corners=True, mode='bilinear', padding_mode='border')
+    return sampled.view(-1)
+
+
 # =========================================================
 # 6. Loss Functions
 # =========================================================
@@ -174,29 +189,35 @@ def compute_hausdorff_distance(points_A, points_B):
 # =========================================================
 # 8. Visualization Utilities
 # =========================================================
-def visualize_mesh_overlay(volume, mesh_vertices, mesh_faces):
+def visualize_mesh_overlay(volume, mesh_vertices, mesh_faces, save_path=None):
     faces_flat = np.hstack([np.full((mesh_faces.shape[0],1),3), mesh_faces]).flatten()
     pv_mesh = pv.PolyData(mesh_vertices, faces_flat)
-    plotter = pv.Plotter()
+    plotter = pv.Plotter(off_screen=True)  # offscreen rendering
     plotter.add_volume(volume, cmap="gray", opacity="linear")
     plotter.add_mesh(pv_mesh, color="red", opacity=0.5)
+    if save_path:
+        plotter.screenshot(save_path)
+        print(f"Saved mesh overlay to {save_path}")
     plotter.show()
 
-def plot_point_trajectories(trajectories, point_indices):
+def plot_point_trajectories(trajectories, point_indices, save_path=None):
     traj_np = trajectories.detach().cpu().numpy()
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
     for idx in point_indices:
         ax.plot(traj_np[:, idx, 0], traj_np[:, idx, 1], traj_np[:, idx, 2], marker='o')
     ax.set_title("Point trajectories across cycle")
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved point trajectory plot to {save_path}")
     plt.show()
-
 
 def compute_mesh_volume(vertices, faces):
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    return mesh.volume
+    return abs(mesh.volume)
 
-def plot_volume_comparison(volumes_gt, volumes_pred, title="Volume Comparison"):
+def plot_volume_comparison(volumes_gt, volumes_pred, save_path=None, title="Volume Comparison"):
     frames = np.arange(len(volumes_gt))
     plt.figure(figsize=(6,4))
     plt.plot(frames, volumes_gt, 'o-', color='orange', label="Reference")
@@ -206,39 +227,80 @@ def plot_volume_comparison(volumes_gt, volumes_pred, title="Volume Comparison"):
     plt.title(title)
     plt.legend()
     plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved volume comparison plot to {save_path}")
     plt.show()
 
-def compute_and_plot_volumes(volumes_4d, trajectories, mesh_faces):
+def denormalize_vertices(vertices, volume_shape, voxel_spacing):
     """
-    Compute GT and predicted volumes over 20 frames and plot comparison.
+    Convert normalized [-1,1] coordinates to real-world mm space
+    """
+    H, W, D = volume_shape
+    sx, sy, sz = voxel_spacing  # from nii.header.get_zooms()
+
+    # Convert [-1,1] -> [0,H/W/D]
+    verts = (vertices + 1) / 2.0
+    verts[:, 0] *= D
+    verts[:, 1] *= W
+    verts[:, 2] *= H
+
+    # Scale by voxel spacing (note: marching_cubes uses spacing=(sx,sy,sz))
+    verts[:, 0] *= sx
+    verts[:, 1] *= sy
+    verts[:, 2] *= sz
+
+    return verts
+
+
+def compute_and_plot_volumes(frames, trajectories, mesh_faces, voxel_spacing, spatial_shape, save_path=None):
+    """
+    Compute GT and predicted volumes (mm³) over time and plot comparison.
     Args:
-        volumes_4d: numpy array (T,H,W,D) of binary segmentations
-        trajectories: torch.Tensor (T,N,3) predicted vertex positions
-        mesh_faces: numpy array (F,3)
+        frames: list of 3D numpy arrays (H,W,D)
+        trajectories: torch.Tensor (T,N,3) normalized predicted vertices
+        mesh_faces: numpy array (F,3) mesh connectivity
+        voxel_spacing: tuple (sx, sy, sz)
+        spatial_shape: (H,W,D) of frames
     """
-    num_frames = volumes_4d.shape[0]
-    gt_volumes = []
-    pred_volumes = []
+    num_frames = len(frames)
+    gt_volumes, pred_volumes = [], []
 
-    # 1. GT volume: marching cubes per frame
+    # GT: marching cubes with voxel spacing
     for t in range(num_frames):
-        verts_gt, faces_gt, normals_gt, _ = measure.marching_cubes(volumes_4d[t], level=0.5)
-        gt_volumes.append(compute_mesh_volume(verts_gt, faces_gt))
+        verts_gt, faces_gt, _, _ = measure.marching_cubes(frames[t], level=0.5, spacing=voxel_spacing)
+        gt_volumes.append(abs(compute_mesh_volume(verts_gt, faces_gt)))
 
-    # 2. Predicted volume: use warped vertices from trajectories
+    # Predicted: trajectories → mm
     for t in range(num_frames):
-        verts_pred = trajectories[t].detach().cpu().numpy()
-        pred_volumes.append(compute_mesh_volume(verts_pred, mesh_faces))
+        verts_pred_norm = trajectories[t].detach().cpu().numpy()
+        verts_pred_mm = denormalize_vertices(verts_pred_norm, spatial_shape, voxel_spacing)
+        pred_volumes.append(abs(compute_mesh_volume(verts_pred_mm, mesh_faces)))
 
-    # 3. Plot
-    plot_volume_comparison(gt_volumes, pred_volumes)
+    # Plot
+    frames_idx = np.arange(num_frames)
+    plt.figure(figsize=(6, 4))
+    plt.plot(frames_idx, gt_volumes, 'o-', color='orange', label="Reference")
+    plt.plot(frames_idx, pred_volumes, 'o-', color='blue', label="Predicted")
+    plt.xlabel("Frame (time)")
+    plt.ylabel("Volume (mm³)")
+    plt.title("Volume Comparison")
+    plt.legend()
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved volume comparison plot to {save_path}")
+    else:
+        plt.show()
 
 # =========================================================
 # 9. Training Loop
 # =========================================================
 def train_inr_model(
     siren_model,
-    volumes_4d,
+    frames,
     spatial_coords,
     temporal_coords,
     num_epochs=1000,
@@ -246,46 +308,82 @@ def train_inr_model(
     lambda_cycle=0.1,
     device='cuda'
 ):
-    print(f"Starting training for {num_epochs} epochs with {sample_points} sample points per epoch...")
+    """
+    Training loop using independent frames (no 4D stack).
+    Implements multi-frame reconstruction loss and cycle loss.
+    """
+
+    print(f"Training with multi-frame reconstruction for {num_epochs} epochs...")
+
     siren_model = siren_model.to(device)
-    siren_model.train()
     optimizer = optim.Adam(siren_model.parameters(), lr=3e-5)
 
-    T,H,W,D = volumes_4d.shape
-    volumes_torch = torch.tensor(volumes_4d, dtype=torch.float32, device=device).unsqueeze(1)
-    spatial_coords = torch.tensor(spatial_coords, dtype=torch.float32, device=device)
+    T = len(frames)
+    spatial_coords_torch = torch.tensor(spatial_coords, dtype=torch.float32, device=device)
+
+    # Precompute final frame mask for balanced sampling
+    final_frame_np = frames[-1]
+    final_mask = (final_frame_np.flatten() > 0)
+    fg_indices = torch.where(torch.tensor(final_mask, device=device))[0]
+    bg_indices = torch.where(~torch.tensor(final_mask, device=device))[0]
+
+    def balanced_sample_indices(total_points):
+        half = total_points // 2
+        fg_sample = fg_indices[torch.randint(0, len(fg_indices), (half,))]
+        bg_sample = bg_indices[torch.randint(0, len(bg_indices), (total_points - half,))]
+        return torch.cat([fg_sample, bg_sample])
 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
 
-        # Random sample points
-        idx = torch.randint(0, spatial_coords.shape[0], (sample_points,), device=device)
-        sampled_coords = spatial_coords[idx]
+        # Sample points (balanced FG/BG)
+        if len(fg_indices) > 0:
+            idx = balanced_sample_indices(sample_points)
+        else:
+            idx = torch.randint(0, spatial_coords_torch.shape[0], (sample_points,), device=device)
+        sampled_coords = spatial_coords_torch[idx]
 
-        # Integrate velocity → deformation
-        time_points = torch.tensor(temporal_coords, dtype=torch.float32, device=device)
-        trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_points)
+        # Reconstruction loss over multiple frames
+        recon_losses = []
+        for frame_idx in range(T):
+            # Integrate from frame_idx → T
+            t_start = temporal_coords[frame_idx]
+            t_end = temporal_coords[-1]
+            time_subset = torch.linspace(t_start, t_end, steps=T-frame_idx, device=device)
 
-        # Warp volume I0 to IT
-        warped_points = trajectories[-1]
-        warped_volume = warp_volume(volumes_torch[0].unsqueeze(0), warped_points, (H,W,D))
-        target_volume = volumes_torch[-1].unsqueeze(0)
+            trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_subset)
+            warped_points = trajectories[-1]
 
-        # Losses
-        recon_loss = reconstruction_loss(warped_volume, target_volume)
-        cycle_loss = cycle_consistency_loss(sampled_coords, trajectories)
+            # Sample intensities from frame_idx and final frame
+            I_src = sample_intensity(
+                torch.tensor(frames[frame_idx], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0),
+                sampled_coords
+            )
+            I_target = sample_intensity(
+                torch.tensor(frames[-1], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0),
+                warped_points
+            )
+
+            recon_losses.append(torch.mean((I_src - I_target) ** 2))
+
+        recon_loss = torch.mean(torch.stack(recon_losses))
+
+        # Cycle consistency loss
+        full_trajectories = integrate_velocity_to_deformation(
+            siren_model, sampled_coords, torch.tensor(temporal_coords, device=device)
+        )
+        cycle_loss = torch.mean((sampled_coords - full_trajectories[-1]) ** 2)
+
         total_loss = recon_loss + lambda_cycle * cycle_loss
-
         total_loss.backward()
         optimizer.step()
 
         if epoch % 50 == 0 or epoch == num_epochs - 1:
-            psnr_val = compute_psnr(warped_volume, target_volume)
-            print(f"[Epoch {epoch}/{num_epochs}] Loss={total_loss.item():.6f}, PSNR={psnr_val:.2f} dB")
+            print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, "
+                  f"Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
 
-    print("Finished training.")
+    print("Training complete.")
     return siren_model
-
 
 # =========================================================
 # 10. Main Pipeline
@@ -293,14 +391,14 @@ def train_inr_model(
 if __name__ == "__main__":
     data_path = "data/4007775_aneurysm/nnunet_outputs_pp"
     mesh_output_path = "data/4007775_aneurysm/meshes"
+    visualization_path = "data/4007775_aneurysm/visualizations"
+    os.makedirs(visualization_path, exist_ok=True)
 
     print("=== Step 1: Loading and normalizing 4D CTA data ===")
-    volumes_4d = load_4d_cta(data_path)
-    print(f"Loaded volumes with shape: {volumes_4d.shape} (T,H,W,D)")
-
-    print("Normalizing spatial and temporal coordinates...")
-    spatial_coords = normalize_spatial_coordinates(volumes_4d.shape[1:])
-    temporal_coords = normalize_temporal_coordinates(volumes_4d.shape[0])
+    dataset = CTSequenceDataset(data_path, num_frames=20)
+    frames, temporal_coords = dataset.get_all_frames()
+    spatial_coords = dataset.get_spatial_coords()
+    voxel_spacing = dataset.get_voxel_spacing()
     print(f"Spatial coords: {spatial_coords.shape}, Temporal coords: {temporal_coords.shape}")
 
     print("=== Step 2: Extracting meshes from segmentations ===")
@@ -321,7 +419,7 @@ if __name__ == "__main__":
     print("=== Step 4: Training SIREN model ===")
     trained_model = train_inr_model(
         siren_model,
-        volumes_4d,
+        frames,
         spatial_coords,
         temporal_coords,
         num_epochs=1000,
@@ -338,8 +436,9 @@ if __name__ == "__main__":
     print(f"Trajectories computed: {trajectories.shape} (T, N, 3)")
 
     print("Plotting sample point trajectories (sanity check)...")
-    plot_point_trajectories(trajectories, [0, 500, 1000])
+    traj_plot_path = os.path.join(visualization_path, "point_trajectories.png")
+    plot_point_trajectories(trajectories, [0, 500, 1000], save_path=traj_plot_path)
 
-    print("Computing and plotting volume comparison (Pred vs GT)...")
-    compute_and_plot_volumes(volumes_4d, trajectories, mesh_faces)
-    print("Pipeline complete.")
+    # Save volume comparison plot
+    vol_plot_path = os.path.join(visualization_path, "volume_comparison.png")
+    compute_and_plot_volumes(frames, trajectories, mesh_faces, voxel_spacing, frames[0].shape, save_path=vol_plot_path)
