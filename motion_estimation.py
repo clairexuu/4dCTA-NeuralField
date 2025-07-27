@@ -115,9 +115,11 @@ class VelocityFieldODE(nn.Module):
         t_full = torch.full((phi.shape[0],), t, device=phi.device)
         return self.siren(phi, t_full)
 
-def integrate_velocity_to_deformation(siren_model, points, time_points, method='euler'):
+def integrate_velocity_to_deformation(siren_model, points, time_points, method='rk4'):
     ode_func = VelocityFieldODE(siren_model)
     trajectories = odeint(ode_func, points, time_points, method=method)
+    # Clamp coordinates to prevent boundary violations
+    trajectories = torch.clamp(trajectories, -1.0, 1.0)
     return trajectories  # (T, N, 3)
 
 
@@ -163,6 +165,14 @@ def plot_point_trajectories(trajectories, point_indices, save_path=None):
 def compute_mesh_volume(vertices, faces):
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return abs(mesh.volume)
+
+def compute_frame_volume_gt(frame, voxel_spacing, level=0.5):
+    """Compute ground truth volume for a single frame using marching cubes."""
+    try:
+        verts_gt, faces_gt, _, _ = measure.marching_cubes(frame, level=level, spacing=voxel_spacing)
+        return abs(compute_mesh_volume(verts_gt, faces_gt))
+    except:
+        return 0.0  # Return 0 if marching cubes fails
 
 
 def normalize_vertices_to_grid(vertices, volume_shape, voxel_spacing):
@@ -343,9 +353,12 @@ def train_inr_model(
     frames,
     spatial_coords,
     temporal_coords,
+    mesh_faces,
+    voxel_spacing,
     num_epochs=1000,
     sample_points=10000,
     lambda_cycle=0.1,
+    lambda_volume=0.01,
     device='cuda'
 ):
     """
@@ -356,9 +369,10 @@ def train_inr_model(
     print(f"Using device: {device}")
     print(f"Sample points per epoch: {sample_points}")
     print(f"Lambda cycle: {lambda_cycle}")
+    print(f"Lambda volume: {lambda_volume}")
     
     siren_model = siren_model.to(device)
-    optimizer = optim.Adam(siren_model.parameters(), lr=3e-5)
+    optimizer = optim.Adam(siren_model.parameters(), lr=1e-5)  # Reduced from 3e-5 for stability
     print("✓ Model and optimizer initialized")
 
     T = len(frames)
@@ -445,12 +459,45 @@ def train_inr_model(
         )
         cycle_loss = torch.mean((sampled_coords - full_trajectories[-1]) ** 2)
 
-        # Total loss: reconstruction + λ * cycle
-        total_loss = recon_loss + lambda_cycle * cycle_loss
+        # Volume regularization: Compare predicted vs ground truth volumes
+        volume_loss = 0.0
+        if lambda_volume > 0 and epoch % 10 == 0:  # Compute every 10 epochs to save time
+            volume_losses = []
+            for frame_idx in range(min(5, T)):  # Sample first 5 frames for efficiency
+                # Get GT volume for this frame
+                gt_volume = compute_frame_volume_gt(frames[frame_idx], voxel_spacing)
+                
+                # Get predicted volume by deforming initial mesh to this frame
+                t_target = temporal_coords[frame_idx]
+                time_to_frame = torch.linspace(0, t_target, steps=frame_idx+1, device=device)
+                if len(time_to_frame) > 1:
+                    frame_trajectories = integrate_velocity_to_deformation(
+                        siren_model, sampled_coords[:500], time_to_frame  # Use subset for speed
+                    )
+                    # Approximate volume change based on coordinate displacement
+                    initial_spread = torch.std(sampled_coords[:500], dim=0).mean()
+                    final_spread = torch.std(frame_trajectories[-1], dim=0).mean()
+                    volume_ratio = (final_spread / initial_spread) ** 3
+                    pred_volume = gt_volume * volume_ratio.item()  # Scale initial volume
+                    
+                    volume_losses.append((gt_volume - pred_volume) ** 2)
+            
+            if volume_losses:
+                volume_loss = torch.mean(torch.stack([torch.tensor(v, device=device) for v in volume_losses]))
+
+        # Total loss: reconstruction + λ_cycle * cycle + λ_volume * volume
+        total_loss = recon_loss + lambda_cycle * cycle_loss + lambda_volume * volume_loss
         total_loss.backward()
+        
+        # Add gradient clipping for training stability
+        torch.nn.utils.clip_grad_norm_(siren_model.parameters(), max_norm=1.0)
+        
         optimizer.step()
 
-        print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, "f"Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
+        if lambda_volume > 0 and epoch % 10 == 0:
+            print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}, Volume={volume_loss.item():.6f}")
+        else:
+            print(f"[Epoch {epoch}/{num_epochs}] Total={total_loss.item():.6f}, Recon={recon_loss.item():.6f}, Cycle={cycle_loss.item():.6f}")
 
     training_end_time = time.time()
     total_training_time = training_end_time - training_start_time
@@ -512,9 +559,12 @@ if __name__ == "__main__":
         frames,
         spatial_coords,
         temporal_coords,
+        mesh_faces,
+        voxel_spacing,
         num_epochs=1000,
         sample_points=10000,
         lambda_cycle=0.1,
+        lambda_volume=0.01,
         device=device
     )
     print("Training complete.")
