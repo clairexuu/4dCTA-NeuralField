@@ -71,6 +71,7 @@ class CTSequenceDataset:
         zz, yy, xx = np.meshgrid(z, y, x, indexing='ij')
         
         # Stack coordinates as (x, y, z) following paper's coordinate convention
+        # Note: F.grid_sample expects (x, y, z) format
         raw_coords = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
         
         # Use sklearn MinMaxScaler to normalize to [-1,1]^3

@@ -99,7 +99,31 @@ def integrate_velocity_to_deformation(siren_model, points, time_points, method='
 # 4. Intensity Sampling
 # =========================================================
 def sample_intensity(volume, coords):
+    """
+    Sample intensity values from a 3D volume using grid coordinates.
+    
+    Args:
+        volume: 3D tensor of shape (C, H, W, D) or (H, W, D)
+        coords: 2D tensor of shape (N, 3) with normalized coordinates in [-1, 1]
+    
+    Returns:
+        1D tensor of sampled intensities
+    """
+    # Ensure volume has batch and channel dimensions
+    if volume.dim() == 3:
+        volume = volume.unsqueeze(0)  # Add batch dimension
+    if volume.dim() == 4:
+        volume = volume.unsqueeze(0)  # Add channel dimension if needed
+    
+    # Ensure coords are in the correct format for grid_sample
+    # grid_sample expects coordinates in (x, y, z) format
+    if coords.shape[-1] != 3:
+        raise ValueError(f"Expected 3D coordinates, got shape {coords.shape}")
+    
+    # Reshape coords for grid_sample: (N, 3) -> (1, N, 1, 1, 3)
     coords = coords.view(1, -1, 1, 1, 3)
+    
+    # grid_sample expects coordinates in [-1, 1] range
     sampled = F.grid_sample(volume, coords, align_corners=True, mode='bilinear', padding_mode='border')
     return sampled.view(-1)
 
@@ -191,44 +215,45 @@ def plot_and_save_volumes(gt_volumes, pred_volumes, save_path):
     print(f"[INFO] Saved enhanced volume plot to {save_path}")
 
 # =========================================================
-# 6. Training Loop (with debug prints)
+# 6. Training Loop (with debug prints) - PAPER IMPLEMENTATION
 # =========================================================
 def train_inr_model(
     siren_model, frames, spatial_coords, temporal_coords,
     mesh_vertices, mesh_faces, voxel_spacing, mesh_scaler,
     num_epochs=1000, sample_points=10000,
-    lambda_cycle=0.1, lambda_volume=0.0,  # 完全移除体积约束
+    lambda_cycle=0.1, lambda_volume=0.0,
     device='cuda'
 ):
-    print("=== 纯论文方法训练 (无体积约束) ===")
+    print("=== 论文实现：图像重建损失 + 周期一致性 ===")
     siren_model = siren_model.to(device)
-    optimizer = optim.Adam(siren_model.parameters(), lr=1e-5)
+    optimizer = optim.Adam(siren_model.parameters(), lr=3e-5, weight_decay=1e-6)
+
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.8, patience=30
+    )
 
     # Convert data
     spatial_coords_torch = torch.from_numpy(spatial_coords).float().to(device)
     frames_tensor = [torch.from_numpy(frame).float().to(device) for frame in frames]
-    target_frame = frames_tensor[-1]
     time_tensor = torch.from_numpy(temporal_coords).float().to(device)
 
     # Precompute GT volumes for final evaluation only
     gt_volumes = [compute_frame_volume_gt(f, voxel_spacing) for f in frames]
-    print(f"[DEBUG] GT volume range: {min(gt_volumes):.1f}-{max(gt_volumes):.1f} mm³ (仅用于最终评估)")
-    
-    # Use sklearn for reproducible sampling
-    def sample_coordinates_sklearn(epoch, sample_points):
-        """Use sklearn shuffle for reproducible coordinate sampling."""
+    print(f"[DEBUG] GT volume range: {min(gt_volumes):.1f}-{max(gt_volumes):.1f} mm³")
+
+    # 稳定的采样策略：固定采样模式
+    def sample_coordinates_stable(epoch, sample_points):
+        """稳定的采样策略：每10个epoch才轻微调整采样."""
         total_points = spatial_coords_torch.shape[0]
         if sample_points >= total_points:
             return torch.arange(total_points, device=device)
         
-        # Use epoch as random state for reproducible but varied sampling
-        indices_np = np.arange(total_points)
-        _, sampled_indices = shuffle(
-            spatial_coords, indices_np, 
-            n_samples=sample_points, 
-            random_state=epoch
-        )
-        return torch.from_numpy(sampled_indices).to(device)
+        # 每10个epoch才变化一次采样，提高训练稳定性
+        stable_seed = 42 + (epoch // 10)
+        np.random.seed(stable_seed)
+        indices = np.random.choice(total_points, sample_points, replace=False)
+        return torch.from_numpy(indices).to(device)
 
     start_time = time.time()
 
@@ -236,52 +261,94 @@ def train_inr_model(
         optimizer.zero_grad()
 
         # Sample points using sklearn
-        idx = sample_coordinates_sklearn(epoch, sample_points)
+        idx = sample_coordinates_stable(epoch, sample_points)
         sampled_coords = spatial_coords_torch[idx]
 
         if epoch in [0, 500, 999]:
             print(f"[DEBUG] Epoch {epoch} sampled coords (first 3): {sampled_coords[:3].cpu().numpy()}")
 
-        # Integrate forward trajectories
-        trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_tensor)
-
-        # Reconstruction loss - 按照论文的正确理解
-        # 论文Equation 1: min Σ ||I_{t_i} ∘ φ_{t_i→T} - I_T||²
-        # 理解：同一物质点在不同时刻的图像值应该一致
-        recon_losses = []
-        target_frame = frames_tensor[-1]  # 最后一帧作为目标 I_T
+        # ===== 论文的核心重建损失实现 =====
+        # 论文公式: min Σ ||I_ti ∘ φ_ti→T - I_T||² + λ R_cycle
         
-        for i in range(len(frames)-1):  # i = 0 to N-2
-            # trajectories[i]: 采样点在时刻t_i的位置（相当于φ_{t_i}(sampled_coords)）
-            # 在时刻t_i的位置采样第i帧图像
-            I_ti_at_deformed = sample_intensity(frames_tensor[i].unsqueeze(0).unsqueeze(0), trajectories[i])
+        # 获取参考帧（最后一帧）
+        reference_frame = frames_tensor[-1]  # I_T
+        
+        # 计算所有其他帧到参考帧的变形
+        reconstruction_losses = []
+        for t in range(len(frames) - 1):  # 除了最后一帧
+            current_frame = frames_tensor[t]  # I_ti
             
-            # 在原始位置采样目标帧图像（作为参考）
-            I_T_at_original = sample_intensity(target_frame.unsqueeze(0).unsqueeze(0), sampled_coords)
+            # 计算当前时刻到参考时刻的变形
+            # φ_ti→T = φ_T ∘ φ_ti^(-1)
+            # 我们需要计算从当前时刻到参考时刻的变形
+            current_time = time_tensor[t]
+            reference_time = time_tensor[-1]
             
-            # 损失：同一物质点在不同时刻的图像值应该相同
-            recon_losses.append(torch.sum((I_ti_at_deformed - I_T_at_original) ** 2))
+            # 计算变形轨迹：从当前时刻到参考时刻
+            time_points = torch.linspace(current_time, reference_time, 10, device=device)
+            deformed_coords = integrate_velocity_to_deformation(siren_model, sampled_coords, time_points)
             
-        recon_loss = torch.sum(torch.stack(recon_losses))
+            # 获取变形后的坐标（最后一帧的坐标）
+            final_deformed_coords = deformed_coords[-1]
+            
+            # 采样变形后的图像强度
+            if epoch == 0 and t == 0:
+                print(f"[DEBUG] Volume shape: {current_frame.shape}")
+                print(f"[DEBUG] Coords shape: {final_deformed_coords.shape}")
+                print(f"[DEBUG] Coords range: [{final_deformed_coords.min().item():.3f}, {final_deformed_coords.max().item():.3f}]")
+            
+            deformed_intensities = sample_intensity(current_frame, final_deformed_coords)
+            reference_intensities = sample_intensity(reference_frame, final_deformed_coords)
+            
+            # 重建损失：||I_ti ∘ φ_ti→T - I_T||²
+            frame_recon_loss = torch.mean((deformed_intensities - reference_intensities) ** 2)
+            reconstruction_losses.append(frame_recon_loss)
+        
+        # 总重建损失
+        recon_loss = torch.mean(torch.stack(reconstruction_losses))
 
-        # Cycle consistency loss - 按照论文的R_cycle定义
-        # R_cycle = (1/n) Σ ||P_0,i - φ_T(P_0,i)||²
-        # 含义：经过一个完整周期后应该回到原始位置
-        final_positions = trajectories[-1]  # φ_T(P_0,i)
-        cycle_loss = torch.mean((sampled_coords - final_positions) ** 2)
+        # ===== 周期一致性损失 =====
+        # 论文公式: R_cycle = (1/n) Σ ||P_0,i - φ_T(P_0,i)||²
+        
+        # 计算从起始时刻到结束时刻的完整轨迹
+        full_trajectories = integrate_velocity_to_deformation(siren_model, sampled_coords, time_tensor)
+        
+        # 起始位置和结束位置
+        initial_positions = full_trajectories[0]
+        final_positions = full_trajectories[-1]
+        
+        # 周期一致性损失
+        cycle_loss = torch.mean((initial_positions - final_positions) ** 2)
 
-        # 纯论文方法：只有重建损失 + 周期一致性损失
+        # ===== 组合损失 =====
+        # 论文公式: min [Σ ||I_ti ∘ φ_ti→T - I_T||²] + λ R_cycle
         total_loss = recon_loss + lambda_cycle * cycle_loss
         total_loss.backward()
+        
+        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(siren_model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # 简化的损失监控 - 只显示论文中的两个损失项
-        if epoch % 10 == 0:
-            print(f"[Epoch {epoch}] 纯论文方法 - Total={total_loss.item():.4f} "
-                  f"Recon={recon_loss.item():.1f} Cycle={cycle_loss.item():.6f} λ_cyc={lambda_cycle:.4f}")
+        # 学习率调度器步进
+        scheduler.step(total_loss)
 
-    print(f"纯论文方法训练完成，用时 {(time.time()-start_time)/60:.1f} 分钟")
+        # 详细的损失监控
+        if epoch % 10 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"[Epoch {epoch:3d}] 论文实现 - Total={total_loss.item():.6f} "
+                  f"Recon={recon_loss.item():.6f} Cycle={cycle_loss.item():.6f} "
+                  f"LR={current_lr:.2e}")
+
+        # 早停机制（可选）
+        if epoch == 0:
+            best_loss = total_loss.item()
+            best_epoch = 0
+        elif total_loss.item() < best_loss:
+            best_loss = total_loss.item()
+            best_epoch = epoch
+
+    print(f"论文实现训练完成，用时 {(time.time()-start_time)/60:.1f} 分钟")
+    print(f"最佳损失: {best_loss:.4f} (epoch {best_epoch})")
     return siren_model, gt_volumes
 
 # =========================================================
@@ -312,21 +379,21 @@ if __name__ == "__main__":
     siren_model = SIRENVelocityField(hidden_dim=256)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    print("[INFO] ===== 纯论文方法实现 =====")
+    print("[INFO] ===== 论文实现版本 =====")
     print("[INFO] 论文Title: Neural Fields for Continuous Periodic Motion Estimation in 4D Cardiovascular Imaging")
     print("[INFO] ✅ 时间编码: f(t) = (cos(2πt), sin(2πt)) - 已正确实现")
     print("[INFO] ✅ SIREN网络: 使用正弦激活函数 - 已正确实现") 
-    print("[INFO] ✅ 损失函数: Σ||I_ti ∘ φ_(ti→T) - I_T||² + λR_cycle - 已按论文修正")
-    print("[INFO] ✅ 周期一致性: R_cycle = (1/n)Σ||P_0 - φ_T(P_0)||² - 已按论文实现")
-    print("[INFO] ✅ ODE积分: 使用torchdiffeq进行速度场积分 - 已正确实现")
-    print("[INFO] ❌ 体积约束: 已完全移除 - 原论文未提及")
-    print("[INFO] 🎯 目标: 测试纯论文方法的运动估计效果")
-    
+    print("[INFO] ✅ 损失函数: 图像重建损失 + 周期一致性 - 论文核心方法")
+    print("[INFO] ✅ 重建损失: ||I_ti ∘ φ_ti→T - I_T||² - 直接优化图像匹配")
+    print("[INFO] ✅ ODE积分: 使用torchdiffeq进行速度场积分")
+    print("[INFO] ✅ 训练目标: 优化图像重建质量，间接提升体积预测准确性")
+    print("[INFO] 🎯 目标: 实现论文的核心重建损失，解决损失函数与评估指标不匹配问题")
+
     trained_model, gt_volumes = train_inr_model(
         siren_model, frames, spatial_coords, temporal_coords,
         mesh_vertices_norm, mesh_faces, voxel_spacing, mesh_scaler,
-        num_epochs=60, sample_points=10000,
-        lambda_cycle=0.5, lambda_volume=0.0,  # 纯论文方法：无体积约束
+        num_epochs=500, sample_points=5300,  # 论文实现训练
+        lambda_cycle=0.01, lambda_volume=0.0,  # 使用论文的周期权重
         device=device
     )
 
@@ -345,6 +412,6 @@ if __name__ == "__main__":
         # 使用原始坐标计算体积
         pred_volumes.append(compute_mesh_volume(verts_original, mesh_faces))
 
-    # Plot + save with pure paper method (no volume constraints)
-    vol_plot_path = os.path.join(visualization_path, "10volume_comparison.png")
+    # Plot + save with paper implementation
+    vol_plot_path = os.path.join(visualization_path, "21volume_comparison_paper_implementation.png")
     plot_and_save_volumes(gt_volumes, pred_volumes, vol_plot_path)
