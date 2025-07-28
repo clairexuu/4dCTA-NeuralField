@@ -325,7 +325,7 @@ if __name__ == "__main__":
     trained_model, gt_volumes = train_inr_model(
         siren_model, frames, spatial_coords, temporal_coords,
         mesh_vertices_norm, mesh_faces, voxel_spacing, mesh_scaler,
-        num_epochs=50, sample_points=10000,
+        num_epochs=60, sample_points=10000,
         lambda_cycle=0.5, lambda_volume=0.0,  # 纯论文方法：无体积约束
         device=device
     )
