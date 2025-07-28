@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils import shuffle
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from trimesh.proximity import ProximityQuery
 
 from dataloader import CTSequenceDataset
 
@@ -90,7 +91,7 @@ class VelocityFieldODE(nn.Module):
         t_full = torch.full((phi.shape[0],), t, device=phi.device)
         return self.siren(phi, t_full)
 
-def integrate_velocity_to_deformation(siren_model, points, time_points, method='rk4'):
+def integrate_velocity_to_deformation(siren_model, points, time_points, method='euler'):
     ode_func = VelocityFieldODE(siren_model)
     trajectories = odeint(ode_func, points, time_points, method=method)
     return torch.clamp(trajectories, -1.0, 1.0)
@@ -214,9 +215,127 @@ def plot_and_save_volumes(gt_volumes, pred_volumes, save_path):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"[INFO] Saved enhanced volume plot to {save_path}")
 
+
+
+def compute_hausdorff_distance(vertices_pred, faces_pred, vertices_gt, faces_gt):
+    """
+    Compute symmetric Hausdorff Distance (HSD) between two meshes.
+
+    Args:
+        vertices_pred: Nx3 numpy array of predicted vertices
+        faces_pred: Mx3 numpy array of predicted faces
+        vertices_gt: Nx3 numpy array of ground-truth vertices
+        faces_gt: Mx3 numpy array of ground-truth faces
+
+    Returns:
+        float: Symmetric Hausdorff Distance (in same units as input, e.g., mm)
+    """
+    mesh_pred = trimesh.Trimesh(vertices=vertices_pred, faces=faces_pred, process=False)
+    mesh_gt = trimesh.Trimesh(vertices=vertices_gt, faces=faces_gt, process=False)
+
+    # Closest point queries
+    pq_pred = ProximityQuery(mesh_gt)
+    dist_pred_to_gt = pq_pred.vertex(mesh_pred.vertices)[0]  # distances
+
+    pq_gt = ProximityQuery(mesh_pred)
+    dist_gt_to_pred = pq_gt.vertex(mesh_gt.vertices)[0]
+
+    # Symmetric HSD
+    return max(dist_pred_to_gt.max(), dist_gt_to_pred.max())
+
+def save_hsd_metrics(hsd_values, save_path):
+    hsd_data = pd.DataFrame({
+        'frame': np.arange(len(hsd_values)),
+        'hsd_mm': hsd_values
+    })
+    hsd_csv_path = save_path.replace('.png', '_hsd.csv')
+    hsd_data.to_csv(hsd_csv_path, index=False, float_format='%.3f')
+    print(f"[INFO] Saved HSD CSV to {hsd_csv_path}")
+    print(f"[INFO] HSD mean: {np.mean(hsd_values):.3f} mm | max: {np.max(hsd_values):.3f} mm")
+
 # =========================================================
 # 6. Training Loop (with debug prints) - PAPER IMPLEMENTATION
 # =========================================================
+
+def sweep_lambda_cycle(
+    lambda_values,
+    frames,
+    spatial_coords,
+    temporal_coords,
+    mesh_vertices,
+    mesh_faces,
+    voxel_spacing,
+    mesh_scaler,
+    num_epochs=500,
+    sample_points=5000,
+    device='cuda',
+    save_dir='sweep_results'
+):
+    """
+    Perform a hyperparameter sweep over lambda_cycle values and save comparison plots + metrics.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    results = []
+
+    for lam in lambda_values:
+        print(f"\n[SWEEP] Testing λ_cycle = {lam}")
+        
+        # Initialize new SIREN model each sweep
+        siren_model = SIRENVelocityField(hidden_dim=256)
+        
+        # Train model
+        trained_model, gt_volumes = train_inr_model(
+            siren_model, frames, spatial_coords, temporal_coords,
+            mesh_vertices, mesh_faces, voxel_spacing, mesh_scaler,
+            num_epochs=num_epochs, sample_points=sample_points,
+            lambda_cycle=lam, lambda_volume=0.0,
+            device=device
+        )
+
+        # Predict volumes
+        mesh_vertices_tensor = torch.from_numpy(mesh_vertices).float().to(device)
+        time_tensor = torch.from_numpy(temporal_coords).float().to(device)
+        with torch.no_grad():
+            mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
+
+        pred_volumes = []
+        for t in range(len(frames)):
+            verts_norm = mesh_trajectories[t].cpu().numpy()
+            verts_original = mesh_scaler.inverse_transform(verts_norm)
+            pred_volumes.append(compute_mesh_volume(verts_original, mesh_faces))
+
+        # Save plot + CSV
+        plot_path = os.path.join(save_dir, f"volume_comparison_lambda{lam}.png")
+        plot_and_save_volumes(gt_volumes, pred_volumes, plot_path)
+
+        # Compute HSD
+        hsd_values = []
+        for t in range(len(frames)):
+            verts_gt, faces_gt, _, _ = measure.marching_cubes(frames[t], level=0.5, spacing=voxel_spacing)
+            verts_pred = mesh_scaler.inverse_transform(mesh_trajectories[t].cpu().numpy())
+            hsd = compute_hausdorff_distance(verts_pred, mesh_faces, verts_gt, faces_gt)
+            hsd_values.append(hsd)
+
+        mean_hsd = float(np.mean(hsd_values))
+        print(f"[RESULT] λ_cycle={lam} → Mean HSD={mean_hsd:.3f} mm")
+
+        # Save summary
+        results.append({
+            'lambda_cycle': lam,
+            'mean_hsd_mm': mean_hsd,
+            'volume_r2': r2_score(gt_volumes, pred_volumes),
+            'mae_mm3': mean_absolute_error(gt_volumes, pred_volumes)
+        })
+
+    # Save sweep results to CSV
+    df_results = pd.DataFrame(results)
+    sweep_csv = os.path.join(save_dir, "sweep_summary.csv")
+    df_results.to_csv(sweep_csv, index=False, float_format='%.4f')
+    print(f"[SWEEP] Summary saved to {sweep_csv}")
+
+    return df_results
+
+
 def train_inr_model(
     siren_model, frames, spatial_coords, temporal_coords,
     mesh_vertices, mesh_faces, voxel_spacing, mesh_scaler,
@@ -378,40 +497,75 @@ if __name__ == "__main__":
     # Train model with fixed parameters
     siren_model = SIRENVelocityField(hidden_dim=256)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    print("[INFO] ===== 论文实现版本 =====")
-    print("[INFO] 论文Title: Neural Fields for Continuous Periodic Motion Estimation in 4D Cardiovascular Imaging")
-    print("[INFO] ✅ 时间编码: f(t) = (cos(2πt), sin(2πt)) - 已正确实现")
-    print("[INFO] ✅ SIREN网络: 使用正弦激活函数 - 已正确实现") 
-    print("[INFO] ✅ 损失函数: 图像重建损失 + 周期一致性 - 论文核心方法")
-    print("[INFO] ✅ 重建损失: ||I_ti ∘ φ_ti→T - I_T||² - 直接优化图像匹配")
-    print("[INFO] ✅ ODE积分: 使用torchdiffeq进行速度场积分")
-    print("[INFO] ✅ 训练目标: 优化图像重建质量，间接提升体积预测准确性")
-    print("[INFO] 🎯 目标: 实现论文的核心重建损失，解决损失函数与评估指标不匹配问题")
 
-    trained_model, gt_volumes = train_inr_model(
-        siren_model, frames, spatial_coords, temporal_coords,
-        mesh_vertices_norm, mesh_faces, voxel_spacing, mesh_scaler,
-        num_epochs=500, sample_points=5300,  # 论文实现训练
-        lambda_cycle=0.01, lambda_volume=0.0,  # 使用论文的周期权重
-        device=device
+    # Sweep over multiple λ_cycle values
+    lambda_values = [0.01, 0.05, 0.1, 0.5, 1.0]
+    sweep_results = sweep_lambda_cycle(
+        lambda_values,
+        frames,
+        spatial_coords,
+        temporal_coords,
+        mesh_vertices_norm,
+        mesh_faces,
+        voxel_spacing,
+        mesh_scaler,
+        num_epochs=500,    # shorter for sweep
+        sample_points=5300,
+        device=device,
+        save_dir=os.path.join(visualization_path, "lambda_sweep")
     )
 
-    # Predict volumes using sklearn scaler for inverse transform
-    mesh_vertices_tensor = torch.from_numpy(mesh_vertices_norm).float().to(device)
-    time_tensor = torch.from_numpy(temporal_coords).float().to(device)
-    with torch.no_grad():
-        mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
+    print(sweep_results)
+    
+    # print("[INFO] ===== 论文实现版本 =====")
+    # print("[INFO] 论文Title: Neural Fields for Continuous Periodic Motion Estimation in 4D Cardiovascular Imaging")
+    # print("[INFO] ✅ 时间编码: f(t) = (cos(2πt), sin(2πt)) - 已正确实现")
+    # print("[INFO] ✅ SIREN网络: 使用正弦激活函数 - 已正确实现") 
+    # print("[INFO] ✅ 损失函数: 图像重建损失 + 周期一致性 - 论文核心方法")
+    # print("[INFO] ✅ 重建损失: ||I_ti ∘ φ_ti→T - I_T||² - 直接优化图像匹配")
+    # print("[INFO] ✅ ODE积分: 使用torchdiffeq进行速度场积分")
+    # print("[INFO] ✅ 训练目标: 优化图像重建质量，间接提升体积预测准确性")
+    # print("[INFO] 🎯 目标: 实现论文的核心重建损失，解决损失函数与评估指标不匹配问题")
 
-    pred_volumes = []
-    for t in range(len(frames)):
-        # Use sklearn scaler for inverse transform
-        verts_norm = mesh_trajectories[t].cpu().numpy()
-        verts_original = mesh_scaler.inverse_transform(verts_norm)
+    # trained_model, gt_volumes = train_inr_model(
+    #     siren_model, frames, spatial_coords, temporal_coords,
+    #     mesh_vertices_norm, mesh_faces, voxel_spacing, mesh_scaler,
+    #     num_epochs=500, sample_points=5300,  # 论文实现训练
+    #     lambda_cycle=0.01, lambda_volume=0.0,  # 使用论文的周期权重
+    #     device=device
+    # )
+
+    # # Predict volumes using sklearn scaler for inverse transform
+    # mesh_vertices_tensor = torch.from_numpy(mesh_vertices_norm).float().to(device)
+    # time_tensor = torch.from_numpy(temporal_coords).float().to(device)
+    # with torch.no_grad():
+    #     mesh_trajectories = integrate_velocity_to_deformation(trained_model, mesh_vertices_tensor, time_tensor)
+
+    # pred_volumes = []
+    # for t in range(len(frames)):
+    #     # Use sklearn scaler for inverse transform
+    #     verts_norm = mesh_trajectories[t].cpu().numpy()
+    #     verts_original = mesh_scaler.inverse_transform(verts_norm)
         
-        # 使用原始坐标计算体积
-        pred_volumes.append(compute_mesh_volume(verts_original, mesh_faces))
+    #     # 使用原始坐标计算体积
+    #     pred_volumes.append(compute_mesh_volume(verts_original, mesh_faces))
 
-    # Plot + save with paper implementation
-    vol_plot_path = os.path.join(visualization_path, "21volume_comparison_paper_implementation.png")
-    plot_and_save_volumes(gt_volumes, pred_volumes, vol_plot_path)
+    # # Plot + save with paper implementation
+    # vol_plot_path = os.path.join(visualization_path, "21volume_comparison_paper_implementation.png")
+    # plot_and_save_volumes(gt_volumes, pred_volumes, vol_plot_path)
+
+    # # Compute HSD for each frame
+    # hsd_values = []
+    # for t in range(len(frames)):
+    #     # Ground truth mesh for frame t
+    #     verts_gt, faces_gt, _, _ = measure.marching_cubes(frames[t], level=0.5, spacing=voxel_spacing)
+
+    #     # Predicted mesh (inverse transform normalized trajectory)
+    #     verts_pred = mesh_scaler.inverse_transform(mesh_trajectories[t].cpu().numpy())
+
+    #     hsd = compute_hausdorff_distance(verts_pred, mesh_faces, verts_gt, faces_gt)
+    #     hsd_values.append(hsd)
+
+    # print(f"[INFO] HSD range: min={np.min(hsd_values):.3f} mm, max={np.max(hsd_values):.3f} mm, mean={np.mean(hsd_values):.3f} mm")
+    # hsd_plot_path = os.path.join(visualization_path, "21hsd.png")
+    # save_hsd_metrics(hsd_values, hsd_plot_path)
