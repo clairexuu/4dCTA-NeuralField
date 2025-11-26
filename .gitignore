@@ -1,0 +1,7 @@
+.idea
+.venv
+data/
+test_data/
+*.pdf
+*.txt
+__pycache__
